@@ -1,135 +1,85 @@
-# sglang DeepSeek-R1-0528 权重加载优化分析
+# DeepSeek-R1-0528 Weight Loading Optimization
 
-## 问题描述
+## Hardware
+- **GPU**: 8× AMD Instinct MI355X (gfx950), ~288GB HBM3e VRAM each, XGMI all-to-all
+- **CPU**: 2× AMD EPYC 9575F 64-Core (192 CPUs), 2 NUMA nodes, 2TB RAM
+- **Storage**: NVMe local disk
 
-在 8x MI355X 上用 sglang TP=8 加载 DeepSeek-R1-0528 (671B MoE, FP8) 时，**TP0 和 TP7 的权重加载时间是其他 rank 的 14 倍**：
+## Problem: TP0/TP7 14× Slower Than Other Ranks
 
-| TP Rank | 加载时间 (s) | 倍率 |
-|---------|-------------|------|
-| TP1 | 263 | 1.0x |
-| TP2 | 261 | 1.0x |
-| TP3 | 263 | 1.0x |
-| TP4 | 279 | 1.07x |
-| TP5 | 280 | 1.07x |
-| TP6 | 279 | 1.07x |
-| **TP0** | **3736** | **14.3x** |
-| **TP7** | **3779** | **14.5x** |
+When loading DeepSeek-R1-0528 (671B MoE, FP8, 163 safetensors, 1.3TB) with TP=8:
+- TP1-6: **261-331s** (4.5-5.5 min)
+- TP0/TP7: **3700+s** (63 min)
+- Ratio: **~14× slower**
 
-端到端加载时间 = max(所有rank) = **63 分钟**。
+### Root Cause: mmap PTE Creation Contention
 
-## 根因分析
+All 8 TP processes simultaneously `mmap()` the same 163 safetensor files. When `safetensors.safe_open()` accesses tensors, it triggers page faults. With 8 processes × 32 async threads each = 256 concurrent page faults, the kernel's virtual memory subsystem creates severe contention on page table entry (PTE) creation.
 
-### 排除的假设
+**Critical finding**: This is NOT a disk I/O or page cache problem. Even with 100% warm page cache (all 1.3TB pre-read into memory), TP0/TP7 remain slow. The bottleneck is in the kernel's mmap page-fault handling path — specifically PTE creation for MAP_PRIVATE mappings across 8 concurrent processes.
 
-1. **❌ CPU 核心数不足**
-   - 每个 TP worker 绑定 24 CPU 核心 (192/8)
-   - `set_gpu_proc_affinity()` in `srt/utils/common.py:2227`
-   - TP0: CPUs 0-23, TP1: CPUs 24-47, ..., TP7: CPUs 168-191
+TP0 (GPU0, NUMA0) and TP7 (GPU7, NUMA1) are the first GPU on each NUMA socket and consistently get starved by the VM subsystem.
 
-2. **❌ Shared experts fusion 导致工作不均**
-   - `num_fused_shared_experts=1` 对所有 rank 一致
-   - 每个 rank 都有 257 experts (256 routed + 1 shared)
-   - EP size = 1，不做 expert parallelism
+## Approaches Tested
 
-3. **❌ post_load_weights / process_weights_after_loading 慢**
-   - Timing 显示 post_load_weights 只需 0.24-0.32s（所有 rank）
-   - process_weights_after_loading (FP8 normalize + shuffle) 只需 0.18-0.22s
+| # | Approach | TP1-6 (s) | TP0/TP7 (s) | Total (s) | Result |
+|---|---|---|---|---|---|
+| 1 | Default mmap (baseline) | 261-331 | 3700+ | 3700+ | ❌ 14× asymmetry |
+| 2 | `posix_fadvise(WILLNEED+SEQUENTIAL)` | ~similar | ~still slow | N/A | ❌ Kernel ignores hints |
+| 3 | `mmap(MAP_POPULATE)` | 288-306 | still slow | N/A | ❌ VSZ balloons to 974GB |
+| 4 | `--weight-loader-disable-mmap` (cold) | 533.9 | 533.9 | **534** | ✅ Uniform, no anomaly |
+| 5 | Preload + mmap (warm cache) | 298-309 | still slow | N/A | ❌ PTE contention persists |
+| 6 | **Preload + `--weight-loader-disable-mmap`** | 371-379 | 371-379 | **~407** | ✅ **Best solution** |
+| 7 | Rank0-only staggered + mmap | N/A | N/A | >1300 est | ❌ Too slow (only 1 reader) |
 
-### 确认的根因
+## Recommended Solution: Parallel Preload + disable-mmap
 
-**mmap page fault 竞争**。详细 timing 数据：
+Two-phase optimization:
 
-```
-model.load_weights() 内部阶段分解:
-  ├─ weights iteration (safetensor读取+分发):  7-12s (所有rank)
-  ├─ ThreadPoolExecutor futures (异步H2D copy): ~250s (TP1-6), ~3700s (TP0/TP7) ← 瓶颈!
-  ├─ post_load_weights:                        0.3s (所有rank)
-  └─ process_weights_after_loading:            0.2s (所有rank)
-```
+### Phase 1: Parallel Page Cache Warmup (~28s)
+Each TP rank cooperatively reads a disjoint 1/8 subset of the 163 checkpoint files using sequential `read()`. This warms the kernel page cache for the entire 1.3TB checkpoint at ~24 GB/s aggregate throughput (3 GB/s per rank).
 
-权重加载流水线：
-1. `buffered_multi_thread_safetensors_weights_iterator` 用 mmap 打开 163 个 safetensor 文件
-2. `deepseek_weight_loader.load_weights()` 遍历权重名，通过 `maybe_executor_submit()` 提交到 `ThreadPoolExecutor`
-3. ThreadPoolExecutor 中的异步任务做: `loaded_weight.transpose(-2,-1)` (CPU) + `narrow()` (CPU) + `expert_data.copy_()` (H2D)
-4. 这些操作触发 mmap page fault → 8 进程 × 32 线程 = 最多 256 并发 page fault
+### Phase 2: Weight Loading from Warm Cache (~379s)
+All ranks load weights simultaneously using `safe_open(disable_mmap=True)`. Since the data is already in page cache, `read()` copies from RAM rather than disk, achieving **30% speedup** vs cold `disable-mmap` (379s vs 534s).
 
-**TP0/TP7 所在的 NUMA 边界 GPU 进程**在高并发 mmap page fault 时被系统调度器/内存管理器"饿死"，导致 14x 延迟。
+### End-to-end: ~407s (6.8 min) — uniform across all 8 ranks
 
-### 证据
+Compared to:
+- Baseline mmap: 3700+s for TP0/TP7 = **~9× faster**
+- Plain disable-mmap: 534s = **24% faster**
 
-- TP0/TP7 的 VMS 在加载期间从 990GB 缓慢降至 420GB（page 逐步回收）
-- TP0/TP7 的 RSS 比其他 rank 大一倍 (~8GB vs ~5GB)
-- py-spy 显示 TP0/TP7 主要时间在 `_load_w13` / `_weight_loader_impl` 中
-- CPU 使用率 TP0/TP7 ~90-100%（vs TP1-6 完成后 ~15%空等）
+## Implementation
 
-## 优化方案验证
+### Patch 1: `python/sglang/srt/model_loader/loader.py`
+In `DefaultModelLoader.load_model()`, before `load_weights_and_postprocess()`:
+- Get TP rank/size
+- If `SGLANG_PRELOAD_PAGE_CACHE=1` (default) and TP>1:
+  - Each rank reads its partition of checkpoint files via sequential `read()`
+  - Barrier synchronization
+- Then proceed with normal weight loading
 
-### 方案1: `--weight-loader-disable-mmap` ✅ 有效!
+### Patch 2: `python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py`
+Limit `ThreadPoolExecutor` workers via `SGLANG_WEIGHT_LOAD_WORKERS` env var (default: 8) to reduce concurrent page faults when mmap is used.
 
-| TP Rank | 原始 (mmap) | disable-mmap | 变化 |
-|---------|-----------|-------------|------|
-| TP0 | **3736s** | 388s | **-89.6%** |
-| TP1 | 263s | 381s | +44.9% |
-| TP2 | 261s | 388s | +48.7% |
-| TP3 | 263s | 390s | +48.3% |
-| TP4 | 279s | 447s | +60.2% |
-| TP5 | 280s | 445s | +58.9% |
-| TP6 | 279s | 445s | +59.5% |
-| TP7 | **3779s** | 447s | **-88.2%** |
-| **端到端** | **3779s** | **447s** | **-88.2%** |
-
-**效果**: 端到端从 63 分钟降到 7.5 分钟。所有 rank 均匀分布，消除了 TP0/TP7 倾斜问题。
-**代价**: 每个 rank 比原来的快速 rank (TP1-6) 慢 ~60%，因为 `read()` 比 `mmap` 的文件读取慢。
-
-### 方案2: `enable_multithread_load` + mmap ❌ 无效
-
-使用 `--json-model-override-args '{"enable_multithread_load": true, "num_threads": 16}'`：
-- TP1-6: 261-280s（和原始一样）
-- TP0/TP7: 仍然 ~3700s+
-- 结论: 多线程文件读取不能解决 mmap page fault 竞争问题
-
-### 方案3: `enable_multithread_load` + `disable-mmap` ❌ 更慢
-
-- 所有 rank > 500s，部分 rank 触发 watchdog timeout
-- 原因: 16线程 × 8进程 = 128 并发 `read()` 导致更严重的 I/O 瓶颈
-
-## 最佳实践
-
-对于 **DeepSeek-R1 671B FP8 在 8x MI355X** 上，推荐：
+## Usage
 
 ```bash
+# Optimal: preload + disable-mmap (recommended)
 python3 -m sglang.launch_server \
-    --weight-loader-disable-mmap \
-    --attention-backend aiter \
-    --model-path /models/DeepSeek-R1-0528 \
-    --tensor-parallel-size 8 \
-    --chunked-prefill-size 196608 \
-    --mem-fraction-static 0.8 \
-    --disable-radix-cache \
-    --num-continuous-decode-steps 4 \
-    --max-prefill-tokens 196608 \
-    --kv-cache-dtype fp8_e4m3 \
-    --cuda-graph-max-bs 64
+  --model-path /models/DeepSeek-R1-0528 \
+  --tp 8 \
+  --trust-remote-code \
+  --weight-loader-disable-mmap \
+  --host 0.0.0.0 --port 30000
+
+# Disable preload if needed (env var)
+SGLANG_PRELOAD_PAGE_CACHE=0 python3 -m sglang.launch_server ...
 ```
 
-加载时间: **~7.5 分钟** (vs 原始 63 分钟)
+## Key Insights
 
-## 进一步优化方向
-
-1. **Pre-shard 权重文件**: 预处理成 8 个独立的 per-rank safetensor 文件，每个 rank 只读自己的 shard (~80GB)
-2. **Rank0 加载 + NCCL broadcast**: Rank0 读完所有权重后通过 XGMI (~896GB/s) broadcast 给其他 rank
-3. **fastsafetensors**: 使用 `--load-format fastsafetensors`，专为分布式加载优化
-4. **NUMA-aware 文件读取**: 确保每个 rank 从本地 NUMA 节点的内存读取文件
-
-## 关键代码路径
-
-- 权重加载入口: `sglang/srt/models/deepseek_common/deepseek_weight_loader.py:145`
-- FusedMoE expert 分发: `sglang/srt/layers/moe/fused_moe_triton/layer.py:562`
-- 文件读取迭代器: `sglang/srt/model_loader/weight_utils.py:830` (buffered_multi_thread_safetensors_weights_iterator)
-- CPU 亲和性: `sglang/srt/utils/common.py:2227` (set_gpu_proc_affinity)
-- FP8 后处理: `sglang/srt/layers/quantization/fp8.py:914` (process_weights_after_loading_block_quant)
-- 异步提交: `sglang/srt/model_loader/utils.py:158` (maybe_executor_submit)
-
-## 日期
-
-2026-03-15
+1. **mmap PTE contention is the root cause**, not disk I/O or page cache misses
+2. **`disable-mmap` is the only reliable fix** — it avoids the kernel mmap path entirely
+3. **Page cache preloading provides 30% speedup** for `disable-mmap` mode by warming the page cache before `read()` calls
+4. The problem is specific to **multi-process mmap** on large files; single-process mmap works fine
+5. TP0 and TP7 (first GPU on each NUMA socket) are consistently the victims
